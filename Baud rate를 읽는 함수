@@ -1,0 +1,377 @@
+# comport master
+
+### baudrate를 확인하는 명령어
+
+```c
+01 03 00 FE 00 01 E5 FA
+```
+
+### baudrate를 15200으로 바꾸는 명령어
+
+```c
+01 06 00 FE 00 07 A9 F8
+```
+
+### 실행 영상
+
+[20250401-0321-33.9969421.mp4](attachment:e0121264-c63e-4e7e-a994-478426d4fbce:20250401-0321-33.9969421.mp4)
+
+# baudrate.c
+
+![image.png](attachment:6a976657-7661-4f7a-8f99-be9c065f495f:d6a2f963-ef6e-404b-b48c-d423424f3edd.png)
+
+```jsx
+#include <stdio.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <termios.h>
+#include <pthread.h>
+#include <errno.h>
+#include <stdbool.h>
+
+int uart_fd = -1;
+
+uint16_t CRC16_MODBUS(const uint8_t *data, uint16_t length) 
+{
+    uint16_t crc = 0xFFFF;
+    for (uint16_t i = 0; i < length; i++) 
+    {
+        crc ^= (uint16_t)data[i];
+        for (uint8_t j = 0; j < 8; j++) 
+        {
+            if (crc & 0x0001) 
+            {
+                crc = (crc >> 1) ^ 0xA001;
+            } 
+            else 
+            {
+                crc >>= 1;
+            }
+        }
+    }
+    return crc;
+}
+
+int init_uart(const char *port) 
+{
+    uart_fd = open(port, O_RDWR | O_NOCTTY | O_NDELAY);
+    if (uart_fd < 0) 
+    {
+        printf("failed UART open: %s\n", strerror(errno));
+        return -1;
+    }
+
+    struct termios options;
+    tcgetattr(uart_fd, &options);
+    
+    cfsetispeed(&options, B115200);
+    cfsetospeed(&options, B115200);
+    
+    options.c_cflag = (options.c_cflag & ~CSIZE) | CS8;    
+    options.c_cflag &= ~PARENB;                             
+    options.c_cflag &= ~CSTOPB;                            
+    options.c_cflag |= CLOCAL | CREAD;                      
+    options.c_iflag = 0;
+    options.c_oflag = 0;
+    options.c_lflag = 0;
+    
+    tcflush(uart_fd, TCIFLUSH);
+    if (tcsetattr(uart_fd, TCSANOW, &options) != 0) 
+    {
+        printf("failed UART setting\n");
+        close(uart_fd);
+        return -1;
+    }
+    
+    return 0;
+}
+
+int readBaudRate(uint8_t device_addr, bool debug_print) 
+{
+    if (uart_fd < 0 || device_addr > 0x7F) 
+    {
+        if (debug_print) printf("Invalid parameter or UART not initialized\n");
+        return -1;
+    }
+
+    uint8_t cmd[8];
+    cmd[0] = device_addr;      
+    cmd[1] = 0x03;            
+    cmd[2] = 0x00;            
+    cmd[3] = 0xFE;           
+    cmd[4] = 0x00;           
+    cmd[5] = 0x01;            
+    
+    uint16_t crc = CRC16_MODBUS(cmd, 6);
+    cmd[6] = crc & 0xFF;       
+    cmd[7] = (crc >> 8) & 0xFF; 
+
+    if (debug_print)
+    {
+        printf("Sending command to read baud rate: ");
+        for (int i = 0; i < 8; i++) 
+        {
+           printf(" 0x%02X  ", cmd[i]);
+        }
+        printf("\n");
+    }
+
+   
+    int result = write(uart_fd, cmd, 8);
+    if (result != 8)
+    {
+        if (debug_print) printf("Failed to send command\n");
+        return -1;
+    }
+
+    uint8_t response[32];  
+    usleep(100000);       
+    
+    int bytes_read = read(uart_fd, response, sizeof(response));
+    if (bytes_read < 0) 
+    {
+        if (debug_print) printf("Failed to read\n");
+        return -1;
+    }
+
+    printf("read data: ");
+    for (int i = 0; i < bytes_read; i++) 
+    {
+        printf("0x%02X ", response[i]);
+    }
+    printf("\n");
+
+    return 0;  
+ }
+
+void* baudrate_thread(void* arg) 
+{
+    uint8_t device_addr = *(uint8_t*)arg;
+    bool debug_print = true;
+
+    while (1) 
+    {
+        int result = readBaudRate(device_addr, debug_print);
+        
+        if (result < 0) 
+        {
+            printf("Data read failure\n");
+        }
+        
+        sleep(2);
+    }
+    
+    return NULL;
+}
+
+int main() 
+{
+    if (init_uart("/dev/ttyUSB1") < 0) 
+    {  
+        return -1;
+    }
+
+    uint8_t device_addr = 1;
+    pthread_t thread_id;
+    if (pthread_create(&thread_id, NULL, baudrate_thread, &device_addr) != 0) 
+    {
+        printf("Failed to create thread\n");
+        close(uart_fd);
+        return -1;
+    }
+
+    pthread_join(thread_id, NULL);
+
+    close(uart_fd);
+    return 0;
+}
+```
+
+# LED.c
+
+[IMG_3005.mov](attachment:2d227c35-9b7b-4363-8c2a-8665376299ee:IMG_3005.mov)
+
+```cpp
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <termios.h>
+#include <errno.h>
+#include <pthread.h>
+#include <time.h>
+
+#define MODBUS_FUNCTION_CODE 0x05  
+
+unsigned short calculateCRC(unsigned char *data, int len) 
+{
+    unsigned short crc = 0xFFFF;
+    for (int pos = 0; pos < len; pos++) 
+    {
+        crc ^= (unsigned short)data[pos];
+        for (int i = 8; i != 0; i--) 
+        {
+            if ((crc & 0x0001) != 0) 
+            {
+                crc >>= 1;
+                crc ^= 0xA001;
+            } 
+            else
+            {
+                crc >>= 1;
+            }
+        }
+    }
+    return crc;
+}
+
+int setupSerialPort(const char *portName) 
+{
+    int fd = open(portName, O_RDWR | O_NOCTTY | O_NDELAY);
+    if (fd == -1) 
+    {
+        perror("Error opening serial port");
+        return -1;
+    }
+
+    struct termios options;
+    tcgetattr(fd, &options);
+    cfsetispeed(&options, B115200);
+    cfsetospeed(&options, B115200);
+    options.c_cflag &= ~PARENB;
+    options.c_cflag &= ~CSTOPB;
+    options.c_cflag &= ~CSIZE;
+    options.c_cflag |= CS8;
+    options.c_cflag |= (CLOCAL | CREAD);
+    options.c_lflag &= ~(ICANON | ECHO | ECHOE | ISIG);
+    options.c_iflag &= ~(IXON | IXOFF | IXANY);
+    options.c_oflag &= ~OPOST;
+
+    tcsetattr(fd, TCSANOW, &options);
+    return fd;
+}
+
+void sendModbusCommand(int fd, int slaveId, int channel, int value) 
+{
+    unsigned char frame[8];
+    frame[0] = slaveId;
+    frame[1] = MODBUS_FUNCTION_CODE;  
+    frame[2] = (channel >> 8);
+    frame[3] = (channel & 0xFF);
+    frame[4] = (value ? 0xFF : 0x00);
+    frame[5] = 0x00;
+
+    unsigned short crc = calculateCRC(frame, 6);
+    frame[6] = crc & 0xFF;
+    frame[7] = (crc >> 8) & 0xFF;
+
+    int writeAttempts = 3;
+    int bytesWritten;
+    while (writeAttempts-- > 0) 
+    {
+        bytesWritten = write(fd, frame, 8);
+        if (bytesWritten == 8) 
+        {
+            break;  
+        } 
+        else if (writeAttempts == 0) 
+        {
+            perror("Error writing to serial port");
+            return;
+        }
+        usleep(100000);  
+    }
+    tcdrain(fd);
+}
+
+void *blinkLED(void *arg) 
+{
+    struct BlinkParams 
+    {
+        int fd;
+        int slaveId;
+        int channel;
+        int duration;
+        int times;
+    };
+
+    struct BlinkParams *params = (struct BlinkParams *)arg;
+    int fd = params->fd;
+    int slaveId = params->slaveId;
+    int channel = params->channel;
+    int duration = params->duration;
+    int times = params->times;
+
+    for (int i = 0; i < times; i++) 
+    {
+        sendModbusCommand(fd, slaveId, channel, 1);
+        struct timespec req = {0};
+        req.tv_sec = 0;
+        req.tv_nsec = duration * 1000000L;  
+        nanosleep(&req, (struct timespec *)NULL);
+        sendModbusCommand(fd, slaveId, channel, 0); 
+        nanosleep(&req, (struct timespec *)NULL);
+    }
+
+    pthread_exit(NULL);
+}
+
+int main() 
+{
+    int slaveId = 1;
+    int channel;
+    const char *port = "/dev/ttyUSB1";
+    pthread_t thread;
+    int running = 1;
+
+    int fd = setupSerialPort(port);
+    if (fd == -1) 
+    {
+        return 1;
+    }
+
+    while (1) 
+    {
+        printf("choose channel (0-7): ");
+        scanf("%d", &channel);
+        if (channel >= 0 && channel <= 7) 
+        {
+            break;  
+        } 
+        else 
+        {
+            printf("Invalid channel. Please enter a value between 0 and 7.\n");
+        }
+    }
+
+    struct BlinkParams params = {fd, slaveId, channel, 500, 5};
+
+    if (pthread_create(&thread, NULL, blinkLED, (void *)&params) != 0) 
+    {
+        perror("Error creating thread");
+        close(fd);
+        return 1;
+    }
+
+    printf("Press 'q' to exit.\n");
+    char input[2]; 
+    while (running) 
+    {
+        fgets(input, sizeof(input), stdin);
+        if (input[0] == 'q' || input[0] == 'Q') 
+        {
+            running = 0;
+        }
+    }
+
+    pthread_join(thread, NULL); 
+    close(fd); 
+    printf("Program exit.\n");
+    return 0;
+}
+
+```
